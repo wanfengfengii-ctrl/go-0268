@@ -183,6 +183,25 @@ func (s *Service) SubmitReview(ctx context.Context, taskID domain.TaskID, gen do
 			}
 		}
 
+		t, err := loadTaskTx(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		// Reviews may only be recorded once the task has reached the
+		// pending-review phase. Recording a decision earlier and letting it
+		// satisfy the release barrier later would bypass the independent
+		// review requirement, so reject any state outside pending_review.
+		if t.State != domain.StatePendingReview {
+			return &domain.DomainError{
+				Code:           domain.CodeTerminalStateRejected,
+				TaskGeneration: gen,
+				Reasons: []domain.Reason{{
+					Code:    domain.CodeTerminalStateRejected,
+					Message: "reviews may only be submitted in the pending-review state",
+				}},
+			}
+		}
+
 		var n int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM review_decisions WHERE task_id = ?`, string(taskID)).Scan(&n); err != nil {
 			return err
