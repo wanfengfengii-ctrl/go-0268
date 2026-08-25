@@ -282,6 +282,24 @@ func (a *App) handleWitheringReadings(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, err)
 		return
 	}
+	// Coverage evidence may only be appended while the task is actively in the
+	// withering collection state. Checking before any cell is written guarantees
+	// that a request against a not-yet-withering (or already advanced) task is
+	// rejected without leaving valid coverage evidence behind: a failed
+	// submission must never produce qualified cells that later block the
+	// legitimate matrix.
+	if t.State != domain.StateWithering {
+		WriteError(w, &domain.DomainError{
+			Code:           domain.CodeTerminalStateRejected,
+			OperationID:    domain.OperationID(req.OperationID),
+			TaskGeneration: t.Generation,
+			Reasons: []domain.Reason{{
+				Code:    domain.CodeTerminalStateRejected,
+				Message: "task is not in the withering collection state",
+			}},
+		})
+		return
+	}
 	readings := make([]withering.WitheringReading, 0, len(req.Readings))
 	for _, d := range req.Readings {
 		readings = append(readings, withering.WitheringReading{
