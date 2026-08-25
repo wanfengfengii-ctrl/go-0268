@@ -215,20 +215,6 @@ func (s *Service) ReviewCount(ctx context.Context, taskID domain.TaskID) (int, e
 // Terminal performs the single-writer compare-and-swap to settle the task.
 func (s *Service) Terminal(ctx context.Context, taskID domain.TaskID, gen domain.TaskGeneration, cmd TerminalCommand, op domain.OperationID) (TerminalDecision, error) {
 	var out TerminalDecision
-	var fixationCredential *FixationCredential
-	if cmd == CommandRelease {
-		var lt int64
-		if err := s.store.DB.QueryRowContext(ctx, `SELECT logical_time FROM tasks WHERE id = ?`, string(taskID)).Scan(&lt); err != nil {
-			return out, err
-		}
-		credID := "cred-" + string(taskID)
-		if _, err := s.store.DB.ExecContext(ctx, `
-			INSERT INTO fixation_credentials(id, task_id, issued_at) VALUES (?, ?, ?)`,
-			credID, string(taskID), lt); err != nil {
-			return out, err
-		}
-		fixationCredential = &FixationCredential{ID: credID, TaskID: taskID, IssuedAt: domain.LogicalTime(lt)}
-	}
 	err := s.store.WithTx(ctx, func(tx *sql.Tx) error {
 		t, err := loadTaskTx(ctx, tx, taskID)
 		if err != nil {
@@ -260,6 +246,25 @@ func (s *Service) Terminal(ctx context.Context, taskID domain.TaskID, gen domain
 					Reasons:        []domain.Reason{{Code: domain.CodeRoleOverlap, Message: "independent reviews not complete or not approved"}},
 				}
 			}
+		}
+
+		// The fixation credential is minted only for a release, and only after
+		// closure and reviews pass. It is written inside this transaction so a
+		// rejected release (COVERAGE_MISSING, failed reviews, or losing the
+		// single-writer barrier) leaves no usable kill-green credential behind.
+		var fixationCredential *FixationCredential
+		if cmd == CommandRelease {
+			var lt int64
+			if err := tx.QueryRowContext(ctx, `SELECT logical_time FROM tasks WHERE id = ?`, string(taskID)).Scan(&lt); err != nil {
+				return err
+			}
+			credID := "cred-" + string(taskID)
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO fixation_credentials(id, task_id, issued_at) VALUES (?, ?, ?)`,
+				credID, string(taskID), lt); err != nil {
+				return err
+			}
+			fixationCredential = &FixationCredential{ID: credID, TaskID: taskID, IssuedAt: domain.LogicalTime(lt)}
 		}
 
 		// Single-writer barrier: only the first writer transitions the state.
