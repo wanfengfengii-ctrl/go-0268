@@ -270,6 +270,18 @@ func (s *Service) Terminal(ctx context.Context, taskID domain.TaskID, gen domain
 
 		out = TerminalDecision{Command: cmd, Operation: op}
 
+		// Terminal settlement releases the task's resource leases so the
+		// occupied withering slots, air branches, fixation slots, and assay
+		// wells become reusable by a later batch. The release reason records
+		// the command so it is auditable and is never re-activated by the
+		// restart recovery scan, which only clears 'restart-pending' markers.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE resource_leases SET released = 1, release_reason = ?
+			WHERE task_id = ? AND released = 0`,
+			string(cmd), string(taskID)); err != nil {
+			return err
+		}
+
 		if cmd == CommandRelease {
 			var lt int64
 			if err := tx.QueryRowContext(ctx, `SELECT logical_time FROM tasks WHERE id = ?`, string(taskID)).Scan(&lt); err != nil {
