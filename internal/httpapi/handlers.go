@@ -255,7 +255,14 @@ func (a *App) handleWitheringStart(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, err)
 		return
 	}
-	go a.Tasks.TransitionTask(context.Background(), id, domain.StateSlotOccupied, domain.StateWithering, domain.OperationID(req.OperationID))
+	// Synchronously commit the state transition before acknowledging, so that
+	// a duplicate or racing start cannot be reported as success: the optimistic
+	// single-writer update in TransitionTask commits the change (or fails) before
+	// the response is written.
+	if err := a.Tasks.TransitionTask(r.Context(), id, domain.StateSlotOccupied, domain.StateWithering, domain.OperationID(req.OperationID)); err != nil {
+		WriteError(w, err)
+		return
+	}
 	WriteJSON(w, http.StatusOK, map[string]string{"state": string(domain.StateWithering)})
 }
 
