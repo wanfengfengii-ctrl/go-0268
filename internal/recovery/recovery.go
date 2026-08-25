@@ -51,13 +51,19 @@ func (s *Service) rebuildLeases(ctx context.Context) error {
 }
 
 // pendingAttempts returns retryable, not-yet-succeeded device attempts in
-// logical-time order.
+// logical-time order. A call key that has since had a successful attempt is
+// considered complete: its earlier failed attempts remain in the audit log
+// but are no longer pending work to resume.
 func (s *Service) pendingAttempts(ctx context.Context) ([]PendingAttempt, error) {
 	rows, err := s.store.DB.QueryContext(ctx, `
-		SELECT task_id, call_key, attempt_seq, logical_time, device_kind
-		FROM device_attempts
-		WHERE retryable = 1 AND succeeded = 0
-		ORDER BY logical_time, attempt_seq`)
+		SELECT da.task_id, da.call_key, da.attempt_seq, da.logical_time, da.device_kind
+		FROM device_attempts da
+		WHERE da.retryable = 1 AND da.succeeded = 0
+		  AND NOT EXISTS (
+			SELECT 1 FROM device_attempts s
+			WHERE s.task_id = da.task_id AND s.call_key = da.call_key AND s.succeeded = 1
+		  )
+		ORDER BY da.logical_time, da.attempt_seq`)
 	if err != nil {
 		return nil, err
 	}
