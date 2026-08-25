@@ -18,12 +18,20 @@ type idempotencyRecord struct {
 	ResponseJSON  []byte
 }
 
-// runIdempotent executes work inside a transaction with idempotency
+// RunIdempotent executes work inside a transaction with idempotency
 // semantics. work receives the open transaction and returns the JSON response
-// to persist and return to the client. Replaying the same operation id with
-// the same request digest returns the stored response without re-running
-// work; the same operation id with a different digest is rejected with
-// OPERATION_CONTENT_CONFLICT.
+// to persist and return to the client. Replaying the same operation id against
+// the same task with the same request digest returns the stored response
+// without re-running work; the same operation id and task with a different
+// digest is rejected with OPERATION_CONTENT_CONFLICT.
+//
+// The idempotency key is (operation_id, task_id). An operation id scopes to a
+// single client request against a single task: replaying it against a
+// different task is a distinct operation that must run for that task, not
+// replay the first task's response. Scoping the lookup by task_id prevents a
+// shared operation id from returning task A's cached result when the same op
+// id and requesters are later submitted for task B — which would otherwise
+// leave B un-advanced while the client believes B was confirmed.
 func (s *Store) RunIdempotent(
 	ctx context.Context,
 	taskID string,
@@ -34,7 +42,7 @@ func (s *Store) RunIdempotent(
 ) ([]byte, error) {
 	var out []byte
 	err := s.WithTx(ctx, func(tx *sql.Tx) error {
-		rec, found, err := lookupIdempotency(ctx, tx, string(op))
+		rec, found, err := lookupIdempotency(ctx, tx, string(op), taskID)
 		if err != nil {
 			return err
 		}
@@ -80,12 +88,12 @@ func (s *Store) RunIdempotent(
 	return out, nil
 }
 
-func lookupIdempotency(ctx context.Context, tx *sql.Tx, op string) (idempotencyRecord, bool, error) {
+func lookupIdempotency(ctx context.Context, tx *sql.Tx, op, taskID string) (idempotencyRecord, bool, error) {
 	var rec idempotencyRecord
 	var resp []byte
 	err := tx.QueryRowContext(ctx, `
 		SELECT operation_id, task_id, generation, request_digest, response_json
-		FROM idempotency_records WHERE operation_id = ?`, op).
+		FROM idempotency_records WHERE operation_id = ? AND task_id = ?`, op, taskID).
 		Scan(&rec.OperationID, &rec.TaskID, &rec.Generation, &rec.RequestDigest, &resp)
 	if err == sql.ErrNoRows {
 		return idempotencyRecord{}, false, nil

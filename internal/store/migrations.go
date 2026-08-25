@@ -217,12 +217,19 @@ var migrations = []string{
 		fixation_credential_id TEXT NOT NULL DEFAULT ''
 	);
 
+	-- The idempotency key is (operation_id, task_id): an operation id scopes
+	-- to a single client request against a single task. The same op id replayed
+	-- against a different task is a distinct operation and must not replay the
+	-- first task's result. Using a composite primary key instead of operation_id
+	-- alone prevents a shared operation id from replaying one task's cached
+	-- response for a different task (cross-task aliasing).
 	CREATE TABLE IF NOT EXISTS idempotency_records (
-		operation_id   TEXT PRIMARY KEY,
+		operation_id   TEXT NOT NULL,
 		task_id        TEXT NOT NULL,
 		generation     INTEGER NOT NULL,
 		request_digest TEXT NOT NULL,
-		response_json  TEXT NOT NULL
+		response_json  TEXT NOT NULL,
+		PRIMARY KEY (operation_id, task_id)
 	);
 	`,
 }
