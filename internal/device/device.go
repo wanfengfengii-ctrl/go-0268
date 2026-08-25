@@ -36,10 +36,13 @@ func (o Outcome) Retryable() bool {
 
 // Script is a fixed, ordered list of outcomes. The outcome for attempt n is
 // steps[(n-1) % len(steps)], making the sequence restart-safe: a given attempt
-// number always yields the same outcome.
+// number always yields the same outcome. Because the result depends only on
+// the attempt number — not on how many times this script has been invoked or
+// which other call keys have drawn from it — concurrent batches are isolated.
+// Each (task, call key) tracks its own 1-based attempt sequence in the ledger,
+// so one batch's retries can never advance another batch's outcome.
 type Script struct {
 	steps []Outcome
-	next  int
 }
 
 // NewScript builds a script from an ordered outcome list.
@@ -48,12 +51,17 @@ func NewScript(steps ...Outcome) *Script {
 }
 
 // Outcome returns the deterministic outcome for a 1-based attempt number.
+// It is a pure function of the attempt number, so two batches that each pass
+// attempt 1 land on steps[0] regardless of how many times this script has been
+// invoked elsewhere — concurrent batches never advance each other's outcomes.
 func (s *Script) Outcome(attempt int) Outcome {
 	if len(s.steps) == 0 {
 		return OutcomeSuccess
 	}
-	idx := s.next % len(s.steps)
-	s.next++
+	if attempt < 1 {
+		attempt = 1
+	}
+	idx := (attempt - 1) % len(s.steps)
 	return s.steps[idx]
 }
 
