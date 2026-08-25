@@ -156,6 +156,25 @@ type confirmFixationRequest struct {
 	CredentialID string `json:"credential_id"`
 }
 
+// deviceRetryRequest drives /device-attempts/{id}/retry. The kind selects the
+// instrument being retried; on a successful retry the matching closure payload
+// (assay or retest) closes the read that was left open by the earlier
+// DEVICE_RETRYABLE outcome.
+type deviceRetryRequest struct {
+	TaskID      string `json:"task_id"`
+	CallKey     string `json:"call_key"`
+	Kind        string `json:"kind"`
+	OperationID string `json:"operation_id,omitempty"`
+	Generation  int64  `json:"generation,omitempty"`
+	// Assay closure payload, applied when kind is assay_reader.
+	Well       string `json:"well,omitempty"`
+	BlindCode  string `json:"blind_code,omitempty"`
+	Inhibition int64  `json:"inhibition,omitempty"`
+	// Retest closure payload, applied when kind is moisture_meter.
+	LeafTemperature int64 `json:"leaf_temperature,omitempty"`
+	MoistureContent int64 `json:"moisture_content,omitempty"`
+}
+
 // ---- handlers ----
 
 func (a *App) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -448,21 +467,20 @@ func (a *App) handleAssayRead(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, a.deviceRetryable(req.OperationID, t.Generation))
 		return
 	}
-	ev := arbiter.AssayEvidence{
+	// The successful read closes here, sharing the same closure path used by
+	// /device-attempts/{id}/retry so a retry-then-success cannot diverge from
+	// a direct success.
+	closureReq := deviceRetryRequest{
 		Well:       req.Well,
-		BlindCode:  domain.BlindCode(req.BlindCode),
-		Generation: t.Generation,
-		Inhibition: domain.Fixed{Raw: req.Inhibition, Scale: domain.ScalePerTenThousand},
+		BlindCode:  req.BlindCode,
+		Inhibition: req.Inhibition,
 	}
-	if err := a.Arbiter.SubmitAssay(r.Context(), id, t.Generation, ev); err != nil {
+	state, err := a.closeDeviceRead(r.Context(), id, t, device.KindAssayReader, closureReq)
+	if err != nil {
 		WriteError(w, err)
 		return
 	}
-	if err := a.Tasks.TransitionTask(r.Context(), id, domain.StateAssayScreening, domain.StateRetesting, domain.OperationID(req.OperationID)); err != nil {
-		WriteError(w, err)
-		return
-	}
-	WriteJSON(w, http.StatusOK, map[string]string{"state": string(domain.StateRetesting)})
+	WriteJSON(w, http.StatusOK, map[string]string{"state": state})
 }
 
 func (a *App) handleRetestRead(w http.ResponseWriter, r *http.Request) {
@@ -491,20 +509,18 @@ func (a *App) handleRetestRead(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, a.deviceRetryable(req.OperationID, t.Generation))
 		return
 	}
-	ev := arbiter.RetestEvidence{
-		Generation:      t.Generation,
-		LeafTemperature: domain.Fixed{Raw: req.LeafTemperature, Scale: domain.ScaleDecimal1},
-		MoistureContent: domain.Fixed{Raw: req.MoistureContent, Scale: domain.ScalePerTenThousand},
+	// The successful read closes here, sharing the same closure path used by
+	// /device-attempts/{id}/retry.
+	closureReq := deviceRetryRequest{
+		LeafTemperature: req.LeafTemperature,
+		MoistureContent: req.MoistureContent,
 	}
-	if err := a.Arbiter.SubmitRetest(r.Context(), id, t.Generation, ev); err != nil {
+	state, err := a.closeDeviceRead(r.Context(), id, t, device.KindMoistureMeter, closureReq)
+	if err != nil {
 		WriteError(w, err)
 		return
 	}
-	if err := a.Tasks.TransitionTask(r.Context(), id, domain.StateRetesting, domain.StatePendingReview, domain.OperationID(req.OperationID)); err != nil {
-		WriteError(w, err)
-		return
-	}
-	WriteJSON(w, http.StatusOK, map[string]string{"state": string(domain.StatePendingReview)})
+	WriteJSON(w, http.StatusOK, map[string]string{"state": state})
 }
 
 func (a *App) handleRejudgment(w http.ResponseWriter, r *http.Request) {
@@ -614,22 +630,87 @@ func (a *App) handleConfirmFixation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDeviceRetry(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		TaskID  string `json:"task_id"`
-		CallKey string `json:"call_key"`
-		Kind    string `json:"kind"`
-	}
+	var req deviceRetryRequest
 	if err := decodeJSON(r, &req); err != nil {
 		WriteError(w, err)
 		return
 	}
+	id := domain.TaskID(req.TaskID)
 	kind := parseDeviceKind(req.Kind)
-	outcome := a.runDevice(r, domain.TaskID(req.TaskID), kind, req.CallKey)
-	if outcome != device.OutcomeSuccess {
-		WriteError(w, a.deviceRetryable("", 0))
+
+	t, err := a.Tasks.Load(r.Context(), id)
+	if err != nil {
+		WriteError(w, err)
 		return
 	}
-	WriteJSON(w, http.StatusOK, map[string]string{"outcome": "success"})
+	if err := a.checkGeneration(t, req.Generation, req.OperationID); err != nil {
+		WriteError(w, err)
+		return
+	}
+	if err := a.checkTerminal(t, req.OperationID); err != nil {
+		WriteError(w, err)
+		return
+	}
+
+	outcome := a.runDevice(r, id, kind, req.CallKey)
+	if outcome != device.OutcomeSuccess {
+		WriteError(w, a.deviceRetryable(req.OperationID, t.Generation))
+		return
+	}
+
+	// A successful retry must close the read that the earlier DEVICE_RETRYABLE
+	// left open: append the matching evidence version and advance the business
+	// phase, mirroring the happy path of /assays/read and /retests/read. Per
+	// domain rule 6, only a format-correct, generation-matched success appends
+	// evidence; a retry that merely returns success without closing would leave
+	// the task stuck in the pre-read stage with no evidence.
+	state, err := a.closeDeviceRead(r.Context(), id, t, kind, req)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]string{"outcome": "success", "state": state})
+}
+
+// closeDeviceRead applies the closure for a successful device read, selecting
+// the assay or retest branch by instrument kind. It is shared by the direct
+// read endpoints (after they invoke the device) so that the retry path and the
+// happy path always agree on how a successful read closes.
+func (a *App) closeDeviceRead(ctx context.Context, id domain.TaskID, t *task.LeafIntakeTask, kind device.Kind, req deviceRetryRequest) (string, error) {
+	op := domain.OperationID(req.OperationID)
+	switch kind {
+	case device.KindAssayReader:
+		ev := arbiter.AssayEvidence{
+			Well:       req.Well,
+			BlindCode:  domain.BlindCode(req.BlindCode),
+			Generation: t.Generation,
+			Inhibition: domain.Fixed{Raw: req.Inhibition, Scale: domain.ScalePerTenThousand},
+		}
+		if err := a.Arbiter.SubmitAssay(ctx, id, t.Generation, ev); err != nil {
+			return "", err
+		}
+		if err := a.Tasks.TransitionTask(ctx, id, domain.StateAssayScreening, domain.StateRetesting, op); err != nil {
+			return "", err
+		}
+		return string(domain.StateRetesting), nil
+	case device.KindMoistureMeter:
+		ev := arbiter.RetestEvidence{
+			Generation:      t.Generation,
+			LeafTemperature: domain.Fixed{Raw: req.LeafTemperature, Scale: domain.ScaleDecimal1},
+			MoistureContent: domain.Fixed{Raw: req.MoistureContent, Scale: domain.ScalePerTenThousand},
+		}
+		if err := a.Arbiter.SubmitRetest(ctx, id, t.Generation, ev); err != nil {
+			return "", err
+		}
+		if err := a.Tasks.TransitionTask(ctx, id, domain.StateRetesting, domain.StatePendingReview, op); err != nil {
+			return "", err
+		}
+		return string(domain.StatePendingReview), nil
+	default:
+		// Probe reads (withering probes) carry no assay/retest evidence to
+		// close; a successful retry simply resolves the device attempt.
+		return string(t.State), nil
+	}
 }
 
 // ---- helpers ----
